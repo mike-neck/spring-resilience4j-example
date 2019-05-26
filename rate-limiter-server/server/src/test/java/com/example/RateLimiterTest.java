@@ -29,6 +29,7 @@ import reactor.core.publisher.Flux;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 
 @ExtendWith(RateLimiterTest.Params.class)
@@ -48,7 +49,7 @@ class RateLimiterTest {
             return RateLimiterConfig.custom()
                     .limitRefreshPeriod(Duration.ofSeconds(2))
                     .limitForPeriod(2)
-                    .timeoutDuration(Duration.ofSeconds(2))
+                    .timeoutDuration(Duration.ofMillis(100L))
                     .build();
         }
     }
@@ -69,7 +70,7 @@ class RateLimiterTest {
                 .doOnComplete(latch::countDown)
                 .subscribe(runnable -> Try.run(runnable).onFailure(e -> logger.info("error", e)));
 
-        try(AutoCloseable ignored = disposable::dispose) {
+        try (AutoCloseable ignored = disposable::dispose) {
             latch.await();
         }
     }
@@ -78,6 +79,28 @@ class RateLimiterTest {
         EVEN,
         ODD,
         ;
+    }
+
+    @Test
+    void rateLimiterWithFor(RateLimiterConfig config) throws InterruptedException {
+        RateLimiterRegistry registry = RateLimiterRegistry.of(config);
+        List<Names> list = List.of(Names.EVEN, Names.ODD);
+        for (int i = 0; i < 20; i++) {
+            final int id = i;
+            for (Names names : list) {
+                RateLimiter rateLimiter = registry.rateLimiter(names.name());
+                Runnable runnable = RateLimiter.decorateRunnable(
+                        rateLimiter,
+                        () -> logger.info("id: {}, name: {}", id, names));
+                Try.runRunnable(runnable)
+                        .onFailure(
+                                e -> logger.info("error, id: {}, name: {}, error: {}",
+                                        id,
+                                        names,
+                                        e.getClass().getSimpleName()));
+            }
+            Thread.sleep(100L);
+        }
     }
 
     @Test
