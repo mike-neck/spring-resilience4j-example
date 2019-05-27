@@ -40,7 +40,6 @@ import reactor.core.publisher.Mono;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.UnaryOperator;
 
 import static org.springframework.web.reactive.function.server.RequestPredicates.accept;
@@ -68,26 +67,25 @@ public class WebConfig implements WebFluxConfigurer {
     @Bean
     @Order(0)
     WebFilter apiRateLimiterFilter() {
-        AtomicInteger outer = new AtomicInteger(0);
         return (exchange, chain) -> {
-            AtomicInteger inner = new AtomicInteger(0);
             ServerHttpRequest request = exchange.getRequest();
-            UnaryOperator<Mono<Void>> adapter = ApiPathAndApiKey.from(request)
+            String key = ApiPathAndApiKey.from(request)
                     .map(ApiPathAndApiKey::rateLimiterKey)
-                    .map(monoLimiterAdapterRegistry::<Void>getAdapter)
-                    .orElseGet(() -> mono -> Mono.error(() -> new NoApiKey("no x-api-key")));
-            return chain.filter(exchange)
-                    .compose(mono -> adapter.apply(mono)
-                            .doOnEach(sig ->
-                                    logger.info(
-                                            "api rate limiter filter - framework-id: {}, request-id: {} , path: {}, x-api-key: {}, outer: {}, inner: {}",
-                                            request.getId(),
-                                            request.getHeaders().get("X-REQUEST-ID"),
-                                            request.getPath(),
-                                            request.getHeaders().get("X-API-KEY"),
-                                            outer.incrementAndGet(),
-                                            inner.incrementAndGet())));
+                    .orElse("anonymous");
+            UnaryOperator<Mono<ServerWebExchange>> adapter = monoLimiterAdapterRegistry.getAdapter(key);
+            return adapter.apply(Mono.just(exchange))
+                    .doOnEach(sig -> logForFilter(request))
+                    .flatMap(chain::filter);
         };
+    }
+
+    private static void logForFilter(ServerHttpRequest request) {
+        logger.info(
+                "api rate limiter filter - framework-id: {}, request-id: {} , path: {}, x-api-key: {}",
+                request.getId(),
+                request.getHeaders().get("X-REQUEST-ID"),
+                request.getPath(),
+                request.getHeaders().get("X-API-KEY"));
     }
 
     @Bean
