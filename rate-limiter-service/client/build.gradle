@@ -1,0 +1,21 @@
+plugins {
+    id 'java-library'
+}
+
+sourceCompatibility = JavaVersion.VERSION_12
+targetCompatibility = JavaVersion.VERSION_12
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'io.projectreactor.netty:reactor-netty:0.8.8.RELEASE'
+    implementation 'org.slf4j:slf4j-api:1.7.26'
+
+    runtimeOnly 'org.slf4j:slf4j-simple:1.7.26'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.4.2'
+    testImplementation 'io.projectreactor:reactor-test:3.2.9.RELEASE'
+    
+}
