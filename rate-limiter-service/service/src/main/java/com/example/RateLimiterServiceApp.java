@@ -15,19 +15,22 @@
  */
 package com.example;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategy;
 import io.github.resilience4j.ratelimiter.RateLimiterConfig;
 import io.github.resilience4j.ratelimiter.RateLimiterRegistry;
 import io.github.resilience4j.ratelimiter.RequestNotPermitted;
 import io.github.resilience4j.reactor.ratelimiter.operator.RateLimiterOperator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.ParameterizedTypeReference;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.http.codec.json.Jackson2JsonEncoder;
+import org.springframework.util.MimeTypeUtils;
 import org.springframework.web.reactive.function.server.RouterFunction;
 import org.springframework.web.reactive.function.server.ServerRequest;
 import org.springframework.web.reactive.function.server.ServerResponse;
@@ -36,8 +39,6 @@ import reactor.core.publisher.Mono;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Function;
-import java.util.function.UnaryOperator;
 
 import static org.springframework.web.reactive.function.server.RouterFunctions.route;
 
@@ -64,64 +65,63 @@ public class RateLimiterServiceApp {
         return RateLimiterRegistry.of(rateLimiterConfig);
     }
 
-    enum RequestAcceptance {
-        ACCEPT(HttpStatus.OK, Map.of("accept", Boolean.TRUE)),
-        REJECT(HttpStatus.OK, Map.of("accept", Boolean.FALSE)),
-        FORBIDDEN(HttpStatus.FORBIDDEN, Map.of()),
-        ;
-
-        final HttpStatus status;
-        final Map<String, Boolean> body;
-
-        RequestAcceptance(HttpStatus status, Map<String, Boolean> body) {
-            this.status = status;
-            this.body = body;
-        }
+    @Bean
+    ObjectMapper objectMapper() {
+        return new ObjectMapper()
+                .setPropertyNamingStrategy(PropertyNamingStrategy.SNAKE_CASE)
+                .setSerializationInclusion(JsonInclude.Include.NON_NULL);
     }
 
-    @Bean(name = "rateLimiterAdapter")
-    Function<String, UnaryOperator<Mono<RequestAcceptance>>> rateLimiterAdapter(RateLimiterRegistry rateLimiterRegistry) {
+    @Bean
+    Jackson2JsonEncoder jsonEncoder(ObjectMapper objectMapper) {
+        return new Jackson2JsonEncoder(objectMapper, MimeTypeUtils.APPLICATION_JSON);
+    }
+
+    @Bean
+    RateLimiterAdapterManager rateLimiterAdapter(RateLimiterRegistry rateLimiterRegistry) {
         return apiKey -> {
             RateLimiterOperator<RequestAcceptance> operator =
                     RateLimiterOperator.of(rateLimiterRegistry.rateLimiter(apiKey));
             return mono -> Mono.from(operator.apply(mono))
-                    .onErrorResume(RequestNotPermitted.class, requestNotPermitted -> Mono.just(RequestAcceptance.REJECT));
+                    .onErrorResume(
+                            RequestNotPermitted.class,
+                            requestNotPermitted -> Mono.just(RequestAcceptance.REJECT));
         };
-    } 
+    }
 
-    @Bean(name = "serverIdFilter")
-    Function<ServerRequest.Headers, UnaryOperator<Mono<RequestAcceptance>>> serverIdFilter() {
-        return headers -> {
-            List<String> appIds = headers.header("X-APP-ID");
-            return mono -> 
-                    mono.filter(response -> !appIds.isEmpty())
-                            .switchIfEmpty(Mono.just(RequestAcceptance.FORBIDDEN));
-        };
-    } 
+    interface RateLimiterAdapterManager {
+        RateLimiterAdapter take(String name);
+    }
+
+    interface RateLimiterAdapter {
+        Mono<RequestAcceptance> apply(Mono<RequestAcceptance> mono);
+    }
 
     @Bean
     RouterFunction<ServerResponse> routerFunction(
-            @Qualifier("rateLimiterAdapter") Function<String, UnaryOperator<Mono<RequestAcceptance>>> rateLimiterAdapter,
-            @Qualifier("serverIdFilter") Function<ServerRequest.Headers, UnaryOperator<Mono<RequestAcceptance>>> serverIdFilter) {
+            RateLimiterAdapterManager rateLimiterAdapter) {
         return route()
-                .POST("/rate", request -> {
-                    ServerRequest.Headers headers = request.headers();
-                    List<String> apiKeys = headers.header("X-USER-API-KEY");
-                    String apiKey = apiKeys.isEmpty() ? "anonymous" : apiKeys.get(0);
-                    UnaryOperator<Mono<RequestAcceptance>> adapter = rateLimiterAdapter.apply(apiKey);
-                    return Mono.just(RequestAcceptance.ACCEPT)
-                            .compose(adapter)
-                            .compose(serverIdFilter.apply(headers))
-                            .flatMap(map -> ServerResponse.status(map.status)
-                                    .contentType(MediaType.APPLICATION_JSON)
-                                    .header("X-USER-API-KEY", apiKey)
-                                    .headers(hs -> hs.addAll("X-APP-ID", headers.header("X-APP-ID")))
-                                    .body(Mono.just(map.body), new ParameterizedTypeReference<Map<String, Boolean>>() {}))
-                            .doOnSuccess(response -> logger.info(
-                                    "response: {}, server: {}, api-key: {}",
-                                    response.statusCode(),
-                                    headers.header("X-APP-ID"),
-                                    apiKey));
-                }).build();
+                .POST("/rate", request -> handle(rateLimiterAdapter, request)).build();
+    }
+
+    private Mono<ServerResponse> handle(RateLimiterAdapterManager rateLimiterAdapter, ServerRequest request) {
+        ServerRequest.Headers headers = request.headers();
+        List<String> apiKeys = headers.header("X-USER-API-KEY");
+        String apiKey = apiKeys.isEmpty() ? "anonymous" : apiKeys.get(0);
+        RateLimiterAdapter adapter = rateLimiterAdapter.take(apiKey);
+        return Mono.just(RequestAcceptance.ACCEPT)
+                .compose(adapter::apply)
+                .doOnSuccess(acceptance -> logger.info(
+                        "response: {}. body: {}, server: {}, api-key: {}, ", 
+                        acceptance.status,
+                        acceptance.body,
+                        headers.header("X-APP-ID"),
+                        apiKey))
+                .flatMap(map -> ServerResponse.status(map.status)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("X-USER-API-KEY", apiKey)
+                        .headers(hs -> hs.addAll("X-APP-ID", headers.header("X-APP-ID")))
+                        .body(Mono.just(map.body), new ParameterizedTypeReference<Map<String, Boolean>>() {
+                        }));
     }
 }
